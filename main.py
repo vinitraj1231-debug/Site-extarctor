@@ -5,6 +5,8 @@
 # ============================================================
 
 import asyncio
+import aiofiles
+import dns.resolver
 import ipaddress
 import json
 import logging
@@ -12,6 +14,7 @@ import os
 import re
 import socket
 import sqlite3
+import shutil
 import ssl
 import tempfile
 import time
@@ -85,6 +88,15 @@ SENSITIVE_PATHS = [
     "/backup.zip", "/backup.tar.gz", "/dump.sql",
     "/.DS_Store", "/Thumbs.db", "/web.config",
     "/server-status", "/server-info",
+    "/.svn/entries", "/.hg/", "/.bzr/", "/.ssh/id_rsa",
+    "/.ssh/id_rsa.pub", "/.ssh/authorized_keys",
+    "/.vscode/sftp.json", "/.vscode/settings.json",
+    "/composer.json", "/composer.lock", "/package.json", "/package-lock.json",
+    "/Dockerfile", "/docker-compose.yml", "/adminer.php",
+    "/backup/", "/backups/", "/old/", "/temp/", "/tmp/",
+    "/sql.zip", "/db.sql", "/mysql.sql", "/config.js", "/config.json",
+    "/wp-config.php.bak", "/wp-config.php.old", "/wp-config.php.save",
+    "/.aws/credentials", "/.npmrc", "/.python_history",
 ]
 
 TECH_SIGNATURES = {
@@ -92,7 +104,7 @@ TECH_SIGNATURES = {
     "Laravel":     [r"laravel_session", r"csrf-token", r"XSRF-TOKEN"],
     "React":       [r"__REACT_DEVTOOLS_GLOBAL_HOOK__", r"react\.production"],
     "Next.js":     [r"__NEXT_DATA__", r"_next/static"],
-    "Vue\.js":     [r"__VUE__", r"vue\.runtime"],
+    "Vue.js":      [r"__VUE__", r"vue\.runtime"],
     "Nuxt":        [r"__NUXT__", r"nuxt"],
     "Angular":     [r"ng-version", r"angular\.js"],
     "jQuery":      [r"jquery[-\.](\d+\.\d+)"],
@@ -102,7 +114,7 @@ TECH_SIGNATURES = {
     "Nginx":       [r"nginx"],
     "Apache":      [r"apache"],
     "PHP":         [r"x-powered-by.*php", r"\.php"],
-    "ASP\.NET":    [r"__VIEWSTATE", r"asp\.net"],
+    "ASP.NET":     [r"__VIEWSTATE", r"asp\.net"],
     "Django":      [r"csrfmiddlewaretoken", r"django"],
     "Express":     [r"x-powered-by.*express"],
     "Google Analytics": [r"google-analytics\.com", r"gtag\("],
@@ -111,6 +123,27 @@ TECH_SIGNATURES = {
     "Firebase":    [r"firebaseapp\.com", r"firebase"],
     "Stripe":      [r"stripe\.com/v3"],
     "Razorpay":    [r"razorpay"],
+    "Drupal":      [r"Drupal\.settings", r"sites/all", r"drupal\.js"],
+    "Joomla":      [r"joomla!", r"Joomla\.getOptions"],
+    "Magento":     [r"magento", r"mage/"],
+    "Shopify":     [r"shopify", r"cdn\.shopify\.com"],
+    "Ghost":       [r"ghost-sdk", r"ghost\.org"],
+    "Gatsby":      [r"gatsby-init", r"gatsby-app"],
+    "Hugo":        [r"gohugo\.io"],
+    "Jekyll":      [r"jekyll rb", r"jekyll-gist"],
+    "Vite":        [r"@vite/client"],
+    "Webpack":     [r"webpack"],
+    "Babel":       [r"babel-polyfill"],
+    "Materialize": [r"materialize\.min\.css", r"materialize\.js"],
+    "Bulma":       [r"bulma\.min\.css"],
+    "Semantic UI": [r"semantic\.min\.css", r"semantic\.js"],
+    "UIKit":       [r"uikit\.min\.css", r"uikit\.js"],
+    "Font Awesome":[r"font-awesome", r"fa-solid"],
+    "Lodash":      [r"lodash\.min\.js"],
+    "Moment.js":   [r"moment\.min\.js"],
+    "Docker":      [r"docker"],
+    "Kubernetes":  [r"kubernetes", r"k8s"],
+    "Jenkins":     [r"jenkins"],
 }
 
 JS_SECRET_PATTERNS = {
@@ -125,6 +158,14 @@ JS_SECRET_PATTERNS = {
     "Private Key Header":  r"-----BEGIN (RSA |EC )?PRIVATE KEY-----",
     "Mapbox Token":        r"pk\.eyJ1IjoiW[A-Za-z0-9\-_]+",
     "Twilio":              r"SK[0-9a-fA-F]{32}",
+    "Slack Token":         r"xox[baprs]-[0-9a-zA-Z]{10,48}",
+    "GitHub Token":        r"ghp_[a-zA-Z0-9]{36}",
+    "Mailgun API Key":     r"key-[0-9a-zA-Z]{32}",
+    "SendGrid API Key":    r"SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}",
+    "Heroku API Key":      r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    "Facebook Access Token": r"EAACEdEose0cBA[0-9A-Za-z]+",
+    "Square Access Token": r"sqOatp-[0-9A-Za-z\-_]{22}",
+    "Connection String":   r"(mongodb|postgres|mysql|redis|mongodb\+srv):\/\/[^\"'\s]+",
 }
 
 OWASP_MAP = {
@@ -148,6 +189,11 @@ OWASP_MAP = {
     "ssl_self_signed":          ("A02:2021 Cryptographic Failures", "High"),
     "info_disclosure_header":   ("A05:2021 Security Misconfiguration", "Low"),
     "php_info_exposed":         ("A05:2021 Security Misconfiguration", "High"),
+    "exposed_ssh_key":          ("A02:2021 Cryptographic Failures", "Critical"),
+    "exposed_docker_file":      ("A05:2021 Security Misconfiguration", "Medium"),
+    "exposed_source_meta":      ("A05:2021 Security Misconfiguration", "Medium"),
+    "exposed_npmrc":            ("A02:2021 Cryptographic Failures", "High"),
+    "exposed_aws_creds":        ("A02:2021 Cryptographic Failures", "Critical"),
 }
 
 SEVERITY_EMOJI = {
@@ -436,6 +482,160 @@ def scan_js_secrets(js_text: str, js_url: str) -> List[Finding]:
 
 
 # ─── SSL ANALYSIS ──────────────────────────────────────────
+COMMON_PORTS = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 111: "RPCBIND", 135: "RPC", 139: "NetBIOS",
+    143: "IMAP", 443: "HTTPS", 445: "SMB", 993: "IMAPS", 995: "POP3S",
+    1723: "PPTP", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
+    5900: "VNC", 6379: "Redis", 8000: "HTTP-Alt", 8080: "HTTP-Proxy",
+    8443: "HTTPS-Alt", 9000: "Portainer", 27017: "MongoDB"
+}
+
+
+async def scan_port(ip: str, port: int) -> Optional[int]:
+    try:
+        conn = asyncio.open_connection(ip, port)
+        _, writer = await asyncio.wait_for(conn, timeout=2.0)
+        writer.close()
+        await writer.wait_closed()
+        return port
+    except:
+        return None
+
+
+async def port_scan(hostname: str) -> List[Tuple[int, str]]:
+    try:
+        ip = socket.gethostbyname(hostname)
+    except:
+        return []
+
+    tasks = [scan_port(ip, port) for port in COMMON_PORTS.keys()]
+    results = await asyncio.gather(*tasks)
+    open_ports = [(p, COMMON_PORTS[p]) for p in results if p is not None]
+    return open_ports
+
+
+async def extract_site_code(root_url: str, pages_data: List[dict]) -> str:
+    """Download and zip site frontend code"""
+    temp_dir = tempfile.mkdtemp(prefix="site_extract_")
+    # Use a single session for all requests
+    async with aiohttp.ClientSession() as session:
+        try:
+            for page in pages_data:
+                parsed = urlparse(page["url"])
+                # Create local path based on URL path
+                local_path = parsed.path
+                if not local_path or local_path.endswith("/"):
+                    local_path += "index.html"
+                if local_path.startswith("/"):
+                    local_path = local_path[1:]
+
+                full_local_path = os.path.join(temp_dir, local_path)
+                os.makedirs(os.path.dirname(full_local_path), exist_ok=True)
+
+                try:
+                    async with session.get(page["url"]) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            async with aiofiles.open(full_local_path, mode='wb') as f:
+                                await f.write(content)
+                except Exception as e:
+                    log.debug("Failed to extract page %s: %s", page["url"], e)
+
+            # Also download assets
+            all_assets = set()
+            for page in pages_data:
+                all_assets.update(page.get("assets", []))
+
+            for asset_url in all_assets:
+                try:
+                    parsed_asset = urlparse(asset_url)
+                    local_asset_path = parsed_asset.path
+                    if local_asset_path.startswith("/"):
+                        local_asset_path = local_asset_path[1:]
+
+                    full_asset_path = os.path.join(temp_dir, local_asset_path)
+                    os.makedirs(os.path.dirname(full_asset_path), exist_ok=True)
+
+                    async with session.get(asset_url) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            async with aiofiles.open(full_asset_path, mode='wb') as f:
+                                await f.write(content)
+                except Exception as e:
+                    log.debug("Failed to extract asset %s: %s", asset_url, e)
+
+            # Use a safe way to create a temp zip file
+            fd, zip_path_base = tempfile.mkstemp(suffix="")
+            os.close(fd)
+            zip_final_path = shutil.make_archive(zip_path_base, 'zip', temp_dir)
+            return zip_final_path
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def get_dns_records(domain: str) -> Dict[str, List[str]]:
+    records = {}
+    types = ["A", "MX", "TXT", "NS", "CNAME", "SOA"]
+    for t in types:
+        try:
+            answers = dns.resolver.resolve(domain, t)
+            records[t] = [str(r) for r in answers]
+        except:
+            continue
+    return records
+
+
+def detect_waf(headers: Dict[str, str], html: str) -> Optional[str]:
+    waf_sigs = {
+        "Cloudflare": ["cf-ray", "__cfduid", "cloudflare-nginx", "cloudflare"],
+        "Akamai": ["akamai-x-cache", "akamai-ghost", "akamai"],
+        "Sucuri": ["x-sucuri-id", "sucuri", "sucuri.net"],
+        "Imperva": ["x-iinfo", "incap_ses", "visid_incap", "incapsula"],
+        "F5 BIG-IP": ["f5_cspm", "bigipserver", "f5"],
+        "AWS WAF": ["x-amz-cf-id", "aws-waf"],
+        "ModSecurity": ["mod_security", "modsecurity"],
+    }
+
+    blob = (html or "").lower()
+    header_str = "\n".join(f"{k}: {v}" for k, v in headers.items()).lower()
+
+    for waf, sigs in waf_sigs.items():
+        for sig in sigs:
+            if sig in header_str or sig in blob:
+                return waf
+    return None
+
+
+async def get_subdomains(domain: str) -> List[str]:
+    """Passive subdomain enumeration using crt.sh"""
+    subdomains = set()
+    url = f"https://crt.sh/?q=%.{domain}&output=json"
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for entry in data:
+                        name = entry.get("common_name", "")
+                        if name:
+                            # May contain wildcards or multiple names separated by \n
+                            for sub in name.split("\n"):
+                                sub = sub.strip().lower()
+                                if sub.endswith(domain) and "*" not in sub:
+                                    subdomains.add(sub)
+                        alt_names = entry.get("name_value", "")
+                        if alt_names:
+                            for sub in alt_names.split("\n"):
+                                sub = sub.strip().lower()
+                                if sub.endswith(domain) and "*" not in sub:
+                                    subdomains.add(sub)
+    except Exception as e:
+        log.debug("Subdomain enum error for %s: %s", domain, e)
+    return sorted(list(subdomains))
+
+
 async def check_ssl(hostname: str) -> List[Finding]:
     findings = []
     try:
@@ -556,6 +756,31 @@ async def scan_sensitive_paths(session: aiohttp.ClientSession,
                     "Exposed Config File",
                     "Configuration file is publicly accessible.",
                     full_url))
+            elif "id_rsa" in path:
+                findings.append(finding("exposed_ssh_key",
+                    "Exposed SSH Private Key",
+                    "SSH private key is publicly accessible. Severe security risk.",
+                    full_url))
+            elif "Dockerfile" in path or "docker-compose" in path:
+                findings.append(finding("exposed_docker_file",
+                    "Exposed Docker Configuration",
+                    "Docker configuration files can reveal internal infrastructure details.",
+                    full_url))
+            elif "package.json" in path or "composer.json" in path:
+                findings.append(finding("exposed_source_meta",
+                    "Exposed Dependency File",
+                    "Package manifest files reveal technology stack and versions.",
+                    full_url))
+            elif ".npmrc" in path:
+                findings.append(finding("exposed_npmrc",
+                    "Exposed .npmrc File",
+                    "May contain npm registry tokens or auth credentials.",
+                    full_url))
+            elif ".aws/credentials" in path:
+                findings.append(finding("exposed_aws_creds",
+                    "Exposed AWS Credentials",
+                    "AWS credentials file is publicly accessible.",
+                    full_url))
 
         # Open directory listing
         if status == 200 and "text/html" in hdrs.get("content-type", ""):
@@ -657,6 +882,10 @@ async def crawl_site(root_url: str,
                 page.title  = title
                 page.tech   = extract_tech(html, resp_headers)
 
+                # Scan HTML content for secrets
+                html_secrets = scan_js_secrets(html, current)
+                page.findings.extend(html_secrets)
+
                 # Check open directory listing in body
                 if html and re.search(r"Index of /|Directory listing", html, re.IGNORECASE):
                     page.findings.append(finding("open_directory",
@@ -736,11 +965,103 @@ async def crawl_site(root_url: str,
         "findings":        findings_list,
         "severity_counts": severity_counts,
         "pages":           [asdict(p) for p in results],
+    "subdomains":      await get_subdomains(hostname),
+    "dns":             await get_dns_records(hostname),
+    "open_ports":      await port_scan(hostname),
+    "waf":             detect_waf(resp_headers, html) if results else None,
     }
 
 
 # ─── REPORT BUILDERS ───────────────────────────────────────
 def build_text_report(data: dict) -> str:
+    lines = []
+    sep = "=" * 60
+    lines.append(sep)
+    lines.append("  ELITE SECURITY AUDIT REPORT")
+    lines.append(sep)
+    lines.append(f"Target    : {data['target']}")
+    lines.append(f"WAF       : {data.get('waf') or 'None detected'}")
+    lines.append(f"Started   : {data['started_at']}")
+    lines.append(f"Finished  : {data['finished_at']}")
+    lines.append(f"Pages     : {data['page_count']}")
+    lines.append(f"Findings  : {data['finding_count']}")
+    sc = data.get("severity_counts", {})
+    lines.append(
+        f"Severity  : Critical={sc.get('Critical',0)} High={sc.get('High',0)} "
+        f"Medium={sc.get('Medium',0)} Low={sc.get('Low',0)}"
+    )
+    lines.append("")
+    lines.append("DNS RECORDS:")
+    dns_data = data.get("dns", {})
+    if dns_data:
+        for rt, rv in dns_data.items():
+            lines.append(f"  {rt}: {', '.join(rv)}")
+    else:
+        lines.append("  None found")
+
+    lines.append("")
+    lines.append("SUBDOMAINS:")
+    subs = data.get("subdomains", [])
+    if subs:
+        lines.append(", ".join(subs[:50]))
+        if len(subs) > 50: lines.append(f" (+{len(subs)-50} more)")
+    else:
+        lines.append("  None found")
+
+    lines.append("")
+    lines.append("OPEN PORTS:")
+    ports = data.get("open_ports", [])
+    if ports:
+        for p, s in ports:
+            lines.append(f"  {p} ({s})")
+    else:
+        lines.append("  None found")
+
+    lines.append("")
+    lines.append("TECHNOLOGIES DETECTED:")
+    lines.append(", ".join(data["tech"]) if data["tech"] else "  None")
+    lines.append("")
+    lines.append(f"robots.txt  : {'Found' if data.get('robots_txt') else 'Not found'}")
+    lines.append(f"sitemap.xml : {'Found' if data.get('sitemap_xml') else 'Not found'}")
+    lines.append("")
+    lines.append("FINDINGS:")
+    lines.append("-" * 60)
+
+    severity_order = ["Critical", "High", "Medium", "Low", "Info"]
+    findings = data.get("findings", [])
+    for sev in severity_order:
+        sev_findings = [f for f in findings if f.get("severity") == sev]
+        if not sev_findings:
+            continue
+        emoji = SEVERITY_EMOJI.get(sev, "•")
+        lines.append(f"\n{emoji} {sev.upper()} ({len(sev_findings)})")
+        for f in sev_findings:
+            lines.append(f"  [{f['title']}]")
+            lines.append(f"    URL     : {f.get('url','')}")
+            lines.append(f"    OWASP   : {f.get('owasp','')}")
+            lines.append(f"    Detail  : {f.get('description','')}")
+            if f.get("evidence"):
+                lines.append(f"    Evidence: {f['evidence']}")
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("JS ENDPOINTS DISCOVERED:")
+    for ep in data.get("js_endpoints", [])[:50]:
+        lines.append(f"  {ep}")
+    lines.append("")
+    lines.append("CRAWLED PAGES:")
+    for p in data.get("pages", []):
+        lines.append(f"  [{p['status']}] {p['url']}")
+        if p.get("title"):
+            lines.append(f"         Title: {p['title']}")
+    lines.append("")
+    lines.append(sep)
+    lines.append("DISCLAIMER: This report was generated for authorized security")
+    lines.append("auditing purposes only. Unauthorized use is prohibited.")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def build_text_report_old(data: dict) -> str:
     lines = []
     sep = "=" * 60
     lines.append(sep)
@@ -938,11 +1259,15 @@ def build_telegram_summary(data: dict) -> str:
         f"🎯 <b>Scan Complete</b>\n"
         f"<code>{data['target']}</code>\n\n"
         f"📊 <b>Summary</b>\n"
+        f"• WAF: <b>{data.get('waf') or 'None'}</b>\n"
         f"• Pages crawled: <b>{data['page_count']}</b>\n"
         f"• Total findings: <b>{data['finding_count']}</b>\n"
         f"• 🔴 Critical: <b>{crit}</b>  🟠 High: <b>{high}</b>\n"
         f"• 🟡 Medium: <b>{med}</b>  🟢 Low: <b>{low}</b>\n\n"
         f"🛠 <b>Technologies</b>\n{tech_str}\n\n"
+        f"🌐 <b>Recon:</b>\n"
+        f"• Subdomains: <b>{len(data.get('subdomains', []))}</b>\n"
+        f"• Open Ports: <b>{len(data.get('open_ports', []))}</b>\n\n"
         f"🔍 <b>Top Findings</b>\n{top_str}\n\n"
         f"📎 Full report attached below."
     )
@@ -959,6 +1284,7 @@ def main_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="📜 History", callback_data="history")
     builder.button(text="ℹ️ Help",    callback_data="help")
+    builder.button(text="📦 Extract Source", callback_data="extract_info")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -978,6 +1304,10 @@ async def start_handler(message: Message):
         "Authorized passive security reconnaissance tool.\n\n"
         "<b>Commands:</b>\n"
         "/scan &lt;url&gt; — Full security audit\n"
+        "/extract &lt;url&gt; — Extract site code\n"
+        "/subdomains &lt;url&gt; — Subdomain enum\n"
+        "/ports &lt;url&gt; — Port scan\n"
+        "/dns &lt;url&gt; — DNS recon\n"
         "/headers &lt;url&gt; — Headers only\n"
         "/tech &lt;url&gt; — Tech detection\n"
         "/js &lt;url&gt; — JS endpoint analysis\n"
@@ -1135,6 +1465,10 @@ async def help_callback(call: CallbackQuery):
     await call.message.answer(
         "<b>Commands</b>\n\n"
         "/scan &lt;url&gt; — Full passive security audit\n"
+        "/extract &lt;url&gt; — Extract site code & assets\n"
+        "/subdomains &lt;url&gt; — Subdomain enumeration\n"
+        "/ports &lt;url&gt; — Common port scanner\n"
+        "/dns &lt;url&gt; — DNS reconnaissance\n"
         "/headers &lt;url&gt; — Security header check only\n"
         "/tech &lt;url&gt; — Technology fingerprinting\n"
         "/js &lt;url&gt; — JavaScript endpoint extractor\n"
@@ -1142,6 +1476,17 @@ async def help_callback(call: CallbackQuery):
         "/history — Your scan history\n"
         "/export &lt;id&gt; — Export a past scan\n\n"
         "All scans are <b>passive</b>. No exploitation, no auth bypass.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "extract_info")
+async def extract_info_callback(call: CallbackQuery):
+    await call.message.answer(
+        "📦 <b>Site Code Extraction</b>\n\n"
+        "Use <code>/extract &lt;url&gt;</code> to download the frontend source code (HTML, JS, CSS) of a website.\n\n"
+        "The bot will crawl the site and bundle all discovered assets into a ZIP file for you.",
         parse_mode="HTML",
     )
     await call.answer()
@@ -1315,6 +1660,122 @@ async def js_handler(message: Message):
         lines.append(f"\n<b>Sample Endpoints:</b>")
         for ep in sorted(set(all_eps))[:15]:
             lines.append(f"  <code>{ep}</code>")
+
+    await wait.edit_text("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("subdomains"))
+async def subdomains_handler(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Usage: /subdomains example.com")
+        return
+
+    target = args[1].strip()
+    # Strip scheme if present
+    parsed = urlparse(target)
+    domain = parsed.netloc or parsed.path.split("/")[0]
+
+    wait = await message.reply(f"🔍 Enumerating subdomains for <code>{domain}</code>...")
+    subs = await get_subdomains(domain)
+
+    if not subs:
+        await wait.edit_text(f"❌ No subdomains found for <code>{domain}</code>.")
+        return
+
+    lines = [f"🌐 <b>Subdomains found for {domain}:</b>\n"]
+    for s in subs[:100]: # Limit to 100 for telegram
+        lines.append(f"• <code>{s}</code>")
+
+    if len(subs) > 100:
+        lines.append(f"\n<i>... and {len(subs) - 100} more.</i>")
+
+    await wait.edit_text("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("ports"))
+async def ports_handler(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Usage: /ports https://example.com")
+        return
+    try:
+        target = normalize_url(args[1].strip())
+        hostname = urlparse(target).hostname
+    except Exception:
+        await message.reply("❌ Invalid URL.")
+        return
+
+    wait = await message.reply(f"🔌 Scanning common ports for <code>{hostname}</code>...")
+    open_ports = await port_scan(hostname)
+
+    if not open_ports:
+        await wait.edit_text(f"✅ No common open ports found for <code>{hostname}</code>.")
+        return
+
+    lines = [f"🔌 <b>Open Ports found for {hostname}:</b>\n"]
+    for port, service in open_ports:
+        lines.append(f"• <code>{port}</code> ({service})")
+
+    await wait.edit_text("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("extract"))
+async def extract_handler(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Usage: /extract https://example.com")
+        return
+
+    try:
+        target = normalize_url(args[1].strip())
+    except Exception:
+        await message.reply("❌ Invalid URL.")
+        return
+
+    wait = await message.reply(f"📦 <b>Extracting site code:</b> <code>{target}</code>\n\n⏳ This may take a while...")
+
+    try:
+        # We need a crawl first to find assets
+        data = await crawl_site(target, max_pages=15) # Limit for extract command
+        zip_file = await extract_site_code(target, data["pages"])
+
+        await message.reply_document(
+            FSInputFile(zip_file, filename=f"source_{urlparse(target).hostname}.zip"),
+            caption=f"✅ Extracted source for {target}\nPages: {len(data['pages'])}"
+        )
+        if os.path.exists(zip_file):
+            os.remove(zip_file)
+        await wait.delete()
+    except Exception as e:
+        log.exception("Extraction failed")
+        await wait.edit_text(f"❌ Extraction failed: {e}")
+
+
+@router.message(Command("dns"))
+async def dns_handler(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Usage: /dns example.com")
+        return
+
+    target = args[1].strip()
+    parsed = urlparse(target)
+    domain = parsed.netloc or parsed.path.split("/")[0]
+
+    wait = await message.reply(f"🔍 Fetching DNS records for <code>{domain}</code>...")
+    records = await get_dns_records(domain)
+
+    if not records:
+        await wait.edit_text(f"❌ No DNS records found for <code>{domain}</code>.")
+        return
+
+    lines = [f"📋 <b>DNS Records for {domain}:</b>\n"]
+    for rtype, rvals in records.items():
+        lines.append(f"<b>{rtype}:</b>")
+        for val in rvals:
+            lines.append(f"  • <code>{val}</code>")
+        lines.append("")
 
     await wait.edit_text("\n".join(lines), parse_mode="HTML")
 
